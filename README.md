@@ -4,11 +4,11 @@ Real-time cricket match commentator that generates live audio commentary with cr
 
 ## Features
 
-- 🎙️ **Database-Driven Commentary** - Uses pre-generated commentary from MySQL `sentence` field
-- 🎵 **Audio Streaming** - In-memory TTS playback (no disk writes for better performance)
-- 🔊 **Background SFX** - Automatic crowd sound effects with smart ducking
-- 📊 **MySQL Integration** - Polls live match data from Deliveries table
-- 🎭 **Intensity-Based Dynamics** - Voice modulation based on database `intensity` field (low/normal/medium/high/extreme)
+- **Commentary** - Uses pre-generated commentary from MySQL `sentence` field
+- **Audio Streaming** - In-memory TTS playback (no disk writes for better performance)
+- **Background SFX** - Automatic crowd sound effects with smart ducking
+- **MySQL Integration** - Polls live match data from Deliveries table
+- **Intensity-Based Dynamics** - Voice modulation based on database `intensity` field (low/normal/medium/high/extreme)
 
 ## Architecture
 
@@ -19,7 +19,7 @@ Real-time cricket match commentator that generates live audio commentary with cr
        │                    │                    │
        ▼                    ▼                    ▼
 ┌─────────────────────────────────────────────────────┐
-│              Main Commentator Loop                   │
+│              Main Commentator Loop                  |
 └─────────────────────────────────────────────────────┘
        │                    │                    │
        ▼                    ▼                    ▼
@@ -131,112 +131,3 @@ cricket_comp/
     └── crowd_of.wav    # Background crowd SFX
 ```
 
-## Key Improvements (New Architecture)
-
-### 1. **Streaming Audio** (No Disk Writes)
-- TTS audio generated directly to memory (BytesIO)
-- No temporary MP3 files cluttering filesystem
-- Faster playback, lower I/O overhead
-
-### 2. **Modular Design**
-- Separation of concerns across 7 modules
-- Easy to test and maintain individual components
-- Clean dependency injection
-
-### 3. **Better State Management**
-- Encapsulated MatchState dataclass
-- Type-safe operations with clear lifecycle methods
-- Thread-safe queue-based audio handling
-
-### 4. **Proper Error Handling**
-- Comprehensive logging throughout
-- Graceful degradation on subsystem failures
-- Context managers for resource cleanup
-
-### 5. **Configuration Management**
-- Centralized config with dataclasses
-- Environment variable support for sensitive data
-- Easy to override settings
-
-## Troubleshooting
-
-### No commentary generated
-- Check MySQL `Deliveries` table has matching `match_id`
-- Verify API endpoints are accessible
-- Review logs in `cricket_commentary.log`
-
-### Audio issues
-- Ensure `downloads/crowd_of.wav` exists
-- Check ffmpeg installation
-- Verify pygame mixer initialization (check logs)
-
-### Database connection errors
-- Verify MySQL credentials in [config.py](config.py)
-- Check network connectivity to database host
-- Ensure `IndoorCricket` database exists
-
-## Development
-
-### Updating Commentary
-
-Commentary is stored in the database `Deliveries.sentence` field:
-
-```sql
--- Update commentary for specific delivery
-UPDATE Deliveries 
-SET sentence = 'What a magnificent shot!', intensity = 'high' 
-WHERE event_id = 123;
-
--- Batch update for multiple deliveries
-UPDATE Deliveries 
-SET intensity = 'extreme' 
-WHERE runs_scored = 6;
-```
-
-### Adding New Intensity Levels
-
-Edit [commentary.py](commentary.py):
-
-```python
-INTENSITY_MAP = {
-    "low": 2,
-    "normal": 5,
-    "medium": 7,
-    "high": 9,
-    "extreme": 10,
-    "critical": 10  # Add new level
-}
-```
-
-### Customizing Fallback Templates
-
-Edit [commentary.py](commentary.py) to modify templates used when `sentence` is empty:
-
-```python
-TEMPLATES = {
-    6: ["Custom SIX commentary!", "Another six variant!"],
-    4: ["Custom FOUR commentary!"]
-}
-```
-
-### Changing match time slot
-
-Edit [config.py](config.py):
-
-```python
-@dataclass
-class MatchConfig:
-    default_time_hour: int = 19  # Change from 21 to 19 (7 PM)
-```
-
-### Custom excitement levels
-
-Modify `generate()` in [commentary.py](commentary.py) to return different excitement values (0-10).
-
-## License
-
-Proprietary - Indoor Cricket Match System
-
-## Support
-
-For issues or questions, contact the development team.
