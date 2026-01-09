@@ -1,0 +1,60 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cricket_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-Proxima123#}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-IndoorCricket}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker-init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD:-Proxima123#}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cricket_network
+
+  commentator:
+    build: .
+    container_name: cricket_commentator
+    environment:
+      # MySQL Configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Proxima123#}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-IndoorCricket}
+      
+      # ElevenLabs API
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-PSk5GhCjavRcRMo6NtjK}
+      
+      # API Configuration
+      API_BASE_URL: ${API_BASE_URL:-http://192.168.18.120:8000}
+      API_TIMEOUT: ${API_TIMEOUT:-10}
+      
+      # Application Mode
+      USE_DUMMY_MODE: ${USE_DUMMY_MODE:-false}
+      SPEAK_ONLY_DELIVERIES: ${SPEAK_ONLY_DELIVERIES:-true}
+    volumes:
+      - ./audio:/app/audio
+      - ./logs:/app/logs
+      - ./downloads:/app/downloads
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - cricket_network
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  cricket_network:
+    driver: bridge

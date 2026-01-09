@@ -1,0 +1,7 @@
+pymysql>=1.1.0
+requests>=2.31.0
+pygame>=2.5.0
+soundfile>=0.12.1
+pydub>=0.25.1
+elevenlabs>=0.2.0
+python-dotenv>=1.0.0

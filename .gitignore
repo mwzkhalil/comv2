@@ -1,0 +1,83 @@
+# ===================================================================
+# Indoor Cricket Commentary System - Git Ignore
+# ===================================================================
+
+# Environment variables and credentials (IMPORTANT!)
+.env
+.env.local
+.env.*.local
+*.env
+**/credentials.json
+**/secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+mahwiz/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# Logs
+*.log
+logs/
+cricket_commentary.log
+
+# Audio files (generated/temporary)
+audio/*.mp3
+audio/*.wav
+temp_*.mp3
+temp_*.wav
+downloads/*.wav
+
+# Database files (if running locally without Docker)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Docker (optional - uncomment if you don't want to track volumes)
+# docker-compose.override.yml
+
+# Backup files
+*.bak
+*.backup
+*.old
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+.cache/
+
