@@ -81,3 +81,4 @@ temp/
 *.tmp
 .cache/
 
+background_audio/*.wav
