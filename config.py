@@ -44,6 +44,7 @@ class AudioConfig:
     duck_fade_steps: int = 10
     duck_fade_delay: float = 0.02
     sfx_file: str = "./downloads/crowd_of.wav"
+    commentary_bg_file: str = "./background_audio/crowd_of_22050.wav"  # For commentary mixing
     mixer_buffer: int = 512
     mixer_channels: int = 2
     commentary_channel: int = 0
@@ -79,6 +80,8 @@ class PollingConfig:
     error_retry_interval: float = 5.0
     innings_break_sleep: float = 8.0
     match_end_sleep: float = 15.0
+    # Consider deliveries with a ball_timestamp within this many seconds as "recent".
+    deliveries_recent_seconds: int = int(os.getenv("DELIVERIES_RECENT_SECONDS", "10"))
 
 
 @dataclass

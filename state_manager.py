@@ -3,6 +3,7 @@
 from typing import Optional, Dict
 from dataclasses import dataclass, field
 import logging
+import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,8 @@ class MatchState:
     
     # Event tracking
     last_seen_event_id: int = 0
+    # Timestamp of the last seen delivery (ball_timestamp)
+    last_seen_ball_timestamp: Optional[datetime.datetime] = None
     
     # Announcement flags
     match_started_announced: bool = False
@@ -92,6 +95,24 @@ class MatchState:
     def update_last_event_id(self, event_id: int):
         """Update the last seen event ID."""
         self.last_seen_event_id = event_id
+
+    def update_last_seen_timestamp(self, ts):
+        """Update last seen ball timestamp. Accepts datetime or string."""
+        if ts is None:
+            return
+
+        if isinstance(ts, str):
+            try:
+                # Attempt to parse ISO-like string
+                parsed = datetime.datetime.fromisoformat(ts)
+            except Exception:
+                return
+            self.last_seen_ball_timestamp = parsed
+        elif isinstance(ts, datetime.datetime):
+            self.last_seen_ball_timestamp = ts
+        else:
+            # Unsupported type
+            return
     
     def get_winner_name(self) -> str:
         """

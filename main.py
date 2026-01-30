@@ -8,8 +8,8 @@ from config import polling_config, api_config
 from audio_manager import AudioManager
 from commentary import CommentaryGenerator
 from state_manager import MatchStateManager
-from dummy_api_client import get_api_client
-from dummy_database import get_database_manager
+from api_client import CricketAPIClient
+from database import DatabaseManager
 
 # Configure logging
 logging.basicConfig(
@@ -30,8 +30,8 @@ class CricketCommentator:
         logger.info("Initializing Cricket Commentator...")
         
         # Initialize components
-        self.db = get_database_manager(use_dummy=api_config.use_dummy_mode)
-        self.api = get_api_client(use_dummy=api_config.use_dummy_mode)
+        self.db = DatabaseManager()
+        self.api = CricketAPIClient()
         self.audio = AudioManager()
         self.commentary_gen = CommentaryGenerator()
         self.state_mgr = MatchStateManager()
@@ -41,9 +41,9 @@ class CricketCommentator:
         
         if api_config.use_dummy_mode:
             logger.warning("⚠️  RUNNING IN DUMMY MODE - Using mock API and Database data")
+            # In production, dummy mode should not be enabled
         if api_config.speak_only_deliveries:
             logger.info("📢 DELIVERY-ONLY MODE - Speaking only database sentences")
-        
         logger.info("Cricket Commentator initialized")
     
     def setup(self) -> bool:
@@ -199,7 +199,8 @@ class CricketCommentator:
         
         deliveries = self.db.get_new_deliveries(
             state.last_seen_event_id,
-            state.slot_id
+            state.slot_id,
+            state.last_seen_ball_timestamp
         )
         
         for delivery in deliveries:
@@ -213,6 +214,9 @@ class CricketCommentator:
             
             # Update state
             state.update_last_event_id(event_id)
+            # Update last seen timestamp from DB delivered value
+            ts = delivery.get("ball_timestamp")
+            state.update_last_seen_timestamp(ts)
             
             logger.info(
                 f"Ball #{event_id}: {commentary_text} "

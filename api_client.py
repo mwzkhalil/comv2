@@ -48,7 +48,8 @@ class CricketAPIClient:
                 second=0, 
                 microsecond=0
             )
-            timestamp_str = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            # timestamp_str = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            timestamp_str = ts.strftime("%Y-%m-%dT15:00:00")
             
             url = self.get_booking_url()
             params = {"timestamp": timestamp_str}
