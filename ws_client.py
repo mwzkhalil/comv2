@@ -13,7 +13,7 @@ from typing import Optional
 import requests
 import websocket
 
-from config import api_config
+from config import api_config, ws_config
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +58,9 @@ class WSClient:
     def _run(self):
         base = api_config.base_url.rstrip("/")
         ws_url = base.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_url}/ws/live-commentary/{self.match_id}"
+        ws_url = f"{ws_url}{ws_config.ws_endpoint_template.format(match_id=self.match_id)}"
 
-        backoff = 1
+        backoff = ws_config.reconnect_backoff_initial
         while not self._stop.is_set():
             try:
                 logger.info(f"Connecting to WS: {ws_url}")
@@ -68,24 +68,38 @@ class WSClient:
                 def _on_message(ws, message):
                     try:
                         ev = json.loads(message)
+                        event_id = ev.get("event_id")
+                        if event_id:
+                            logger.info(f"Event received: event_id={event_id}, match_id={ev.get('match_id')}")
                         self.event_queue.enqueue(ev)
-                        logger.debug(f"Event enqueued: {ev.get('ball_detection_id')}")
                     except Exception as e:
                         logger.error(f"Malformed WS message: {e}")
 
                 def _on_close(ws, close_status_code, close_msg):
                     logger.warning(f"WS connection closed: {close_status_code} {close_msg}")
 
+                def _on_error(ws, error):
+                    logger.error(f"WS error: {error}")
+
+                headers = {}
+                if ws_config.ws_auth_token:
+                    headers[ws_config.ws_auth_header] = f"Bearer {ws_config.ws_auth_token}"
+
                 wsapp = websocket.WebSocketApp(
                     ws_url,
                     on_message=_on_message,
                     on_close=_on_close,
+                    on_error=_on_error,
+                    header=headers if headers else None,
                 )
 
                 # Before running, attempt to fetch missed events (safe to call repeatedly)
                 self._fetch_missed_events()
 
-                wsapp.run_forever(ping_interval=30, ping_timeout=10)
+                wsapp.run_forever(
+                    ping_interval=ws_config.ping_interval,
+                    ping_timeout=ws_config.ping_timeout
+                )
 
             except Exception as e:
                 logger.error(f"WS error: {e}")
@@ -93,22 +107,27 @@ class WSClient:
             # Exponential backoff on reconnect
             if self._stop.is_set():
                 break
+            logger.info(f"Reconnecting in {backoff:.1f}s...")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff * ws_config.reconnect_backoff_multiplier, ws_config.reconnect_backoff_max)
 
     def _fetch_missed_events(self):
+        """Fetch missed events from REST endpoint on reconnect."""
         last = self.event_queue.get_last_spoken()
         try:
-            url = api_config.base_url.rstrip("/") + "/commentary/missed-events"
+            url = api_config.base_url.rstrip("/") + api_config.missed_events_endpoint
             params = {"match_id": self.match_id}
             if last:
                 params["after_id"] = last
 
-            resp = requests.get(url, params=params, timeout=10)
+            logger.info(f"Fetching missed events: match_id={self.match_id}, after_id={last}")
+            resp = requests.get(url, params=params, timeout=api_config.timeout)
             if resp.status_code == 200:
                 items = resp.json() or []
                 logger.info(f"Fetched {len(items)} missed events")
                 for ev in items:
                     self.event_queue.enqueue(ev)
+            else:
+                logger.warning(f"Missed events endpoint returned {resp.status_code}")
         except Exception as e:
-            logger.debug(f"Failed to fetch missed events: {e}")
+            logger.warning(f"Failed to fetch missed events: {e}")

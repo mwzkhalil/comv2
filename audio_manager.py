@@ -1,13 +1,15 @@
 """
 Audio manager with ElevenLabs streaming TTS + looping background audio
-(using sounddevice, true PCM streaming, no disk writes).
+(using sounddevice, true PCM streaming with optional disk writes for history).
 """
 
 import time
 import threading
 import queue
 import logging
-from typing import Optional, Iterable
+import os
+from typing import Optional, Iterable, Dict
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -22,9 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 class AudioManager:
-    def __init__(self):
+    def __init__(self, db_manager=None):
+        """
+        Initialize AudioManager.
+        
+        Args:
+            db_manager: Optional DatabaseManager instance for saving audio history
+        """
         self.config = audio_config
         self.tts_config = tts_config
+        self.db_manager = db_manager
 
         self.sample_rate = self.config.sampling_rate
         self.channels = 1
@@ -53,17 +62,23 @@ class AudioManager:
         self.target_bg_volume = self.bg_volume
 
         # Commentary queue (priority queue: lower number = higher priority)
-        # Tuple: (priority, counter, enqueue_ts, stream)
+        # Tuple: (priority, counter, enqueue_ts, stream, event_metadata)
         self.audio_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._aq_counter = 0
 
         # TTS buffer for streaming playback
         self.tts_buffer = np.zeros(0, dtype=np.float32)
         self._current_priority: Optional[int] = None
+        self._current_event_metadata: Optional[Dict] = None
 
         # Playback state
         self.stop_event = threading.Event()
         self.playback_thread: Optional[threading.Thread] = None
+
+        # Audio saving setup
+        if self.config.save_audio:
+            os.makedirs(self.config.audio_storage_path, exist_ok=True)
+            logger.info(f"Audio saving enabled: {self.config.audio_storage_path}")
 
         logger.info("AudioManager initialized (sounddevice backend)")
 
@@ -107,22 +122,50 @@ class AudioManager:
     # ------------------------------------------------------------------
     # COMMENTARY QUEUE
     # ------------------------------------------------------------------
-    def queue_commentary(self, text: str, excitement: int = 0):
-        """Queue commentary for playback with optional priority.
+    def queue_commentary(
+        self,
+        text: str,
+        excitement: int = 0,
+        priority: Optional[int] = None,
+        event_id: Optional[str] = None,
+        match_id: Optional[str] = None,
+        **kwargs
+    ):
+        """Queue commentary for playback with optional priority and metadata.
 
-        Priority: lower integer means higher priority. Default priority is 2 (normal).
+        Args:
+            text: Commentary text to speak
+            excitement: Excitement level (0-10) for TTS voice modulation
+            priority: Event priority (0=highest, 2=normal). Defaults to 2.
+            event_id: Event identifier for saving audio history
+            match_id: Match identifier for saving audio history
+            **kwargs: Additional event metadata
         """
         stream = self.generate_tts_stream(text, excitement)
         if not stream:
+            logger.error(f"Failed to generate TTS stream for: {text[:60]}...")
             return
 
-        # Default priority choices could be refined by caller
-        priority = getattr(self, "default_priority", 2)
+        # Default priority if not provided
+        if priority is None:
+            priority = getattr(self, "default_priority", 2)
+        
         self._aq_counter += 1
         enqueue_ts = time.time()
-        # Store enqueue timestamp for latency metrics and the stream object
-        self.audio_queue.put((priority, self._aq_counter, enqueue_ts, stream))
-        logger.info(f"Queued commentary (prio={priority}): {text[:60]}...")
+        
+        # Store event metadata for audio saving
+        event_metadata = {
+            "event_id": event_id,
+            "match_id": match_id,
+            "text": text,
+            "excitement": excitement,
+            "enqueue_ts": enqueue_ts,
+            **kwargs
+        }
+        
+        # Store enqueue timestamp, stream, and metadata
+        self.audio_queue.put((priority, self._aq_counter, enqueue_ts, stream, event_metadata))
+        logger.info(f"Queued commentary (prio={priority}, event_id={event_id}): {text[:60]}...")
 
     # ------------------------------------------------------------------
     # BACKGROUND / PLAYBACK COMPATIBILITY
@@ -198,12 +241,12 @@ class AudioManager:
                 except queue.Empty:
                     continue
 
-                # item is (priority, counter, enqueue_ts, stream)
-                priority, _cnt, enqueue_ts, tts_stream = item
+                # item is (priority, counter, enqueue_ts, stream, event_metadata)
+                priority, _cnt, enqueue_ts, tts_stream, event_metadata = item
 
                 # Log enqueue->start latency
                 latency = time.time() - enqueue_ts
-                logger.info(f"Audio queue latency: {latency:.3f}s (prio={priority})")
+                logger.info(f"Audio queue latency: {latency:.3f}s (prio={priority}, event_id={event_metadata.get('event_id')})")
 
                 self._duck_background(True)
 
@@ -245,20 +288,31 @@ class AudioManager:
                     audio /= 32768.0
                     pcm_chunks.append(audio)
 
-                new_buffer = np.concatenate(pcm_chunks)
+                tts_audio = np.concatenate(pcm_chunks)
+                tts_duration = len(tts_audio) / self.sample_rate
+
+                # Save audio file if enabled (non-blocking)
+                if self.config.save_audio and event_metadata.get("event_id"):
+                    threading.Thread(
+                        target=self._save_audio_file,
+                        args=(tts_audio, event_metadata, tts_duration),
+                        daemon=True
+                    ).start()
 
                 # If something is already playing, decide whether to preempt
                 if self.tts_buffer.size > 0 and self._current_priority is not None:
                     # Preempt if incoming has higher priority (lower number)
                     if priority < self._current_priority:
-                        self.tts_buffer = new_buffer
+                        self.tts_buffer = tts_audio
                         self._current_priority = priority
+                        self._current_event_metadata = event_metadata
                     else:
                         # Append after current buffer
-                        self.tts_buffer = np.concatenate((self.tts_buffer, new_buffer))
+                        self.tts_buffer = np.concatenate((self.tts_buffer, tts_audio))
                 else:
-                    self.tts_buffer = new_buffer
+                    self.tts_buffer = tts_audio
                     self._current_priority = priority
+                    self._current_event_metadata = event_metadata
 
     # ------------------------------------------------------------------
     # DUCKING
@@ -267,6 +321,84 @@ class AudioManager:
         self.target_bg_volume = (
             self.config.ducked_volume if duck else self.config.background_volume
         )
+
+    # ------------------------------------------------------------------
+    # AUDIO SAVING
+    # ------------------------------------------------------------------
+    def _save_audio_file(self, tts_audio: np.ndarray, event_metadata: Dict, tts_duration: float):
+        """Save mixed audio (TTS + background) to disk and database.
+        
+        Args:
+            tts_audio: TTS audio array (float32, mono)
+            event_metadata: Event metadata dict
+            tts_duration: TTS audio duration in seconds
+        """
+        try:
+            event_id = event_metadata.get("event_id")
+            match_id = event_metadata.get("match_id")
+            
+            if not event_id or not match_id:
+                logger.warning("Cannot save audio: missing event_id or match_id")
+                return
+
+            # Mix TTS with background audio
+            # Generate background audio for the duration of TTS
+            bg_samples = int(tts_duration * self.sample_rate)
+            bg_start_idx = self.bg_index % len(self.bg_audio)
+            
+            if bg_start_idx + bg_samples <= len(self.bg_audio):
+                bg_segment = self.bg_audio[bg_start_idx:bg_start_idx + bg_samples]
+            else:
+                # Wrap around
+                remaining = bg_samples - (len(self.bg_audio) - bg_start_idx)
+                bg_segment = np.concatenate([
+                    self.bg_audio[bg_start_idx:],
+                    np.tile(self.bg_audio, (remaining // len(self.bg_audio) + 1))[:remaining]
+                ])
+            
+            # Ensure same length
+            min_len = min(len(tts_audio), len(bg_segment))
+            tts_audio = tts_audio[:min_len]
+            bg_segment = bg_segment[:min_len]
+            
+            # Mix with ducked background volume
+            mixed_audio = tts_audio + (bg_segment * self.config.ducked_volume)
+            
+            # Normalize to prevent clipping
+            max_val = np.abs(mixed_audio).max()
+            if max_val > 1.0:
+                mixed_audio = mixed_audio / max_val * 0.95
+
+            # Save to file
+            filename = f"{event_id}.{self.config.audio_format}"
+            filepath = os.path.join(self.config.audio_storage_path, filename)
+            
+            sf.write(
+                filepath,
+                mixed_audio,
+                self.config.audio_sample_rate,
+                format=self.config.audio_format.upper()
+            )
+            
+            logger.info(f"Saved audio: {filepath} ({tts_duration:.2f}s)")
+
+            # Save to database if db_manager available
+            if self.db_manager:
+                try:
+                    # Use event_id as ball_id (or extract from metadata if available)
+                    ball_id = event_metadata.get("ball_id") or event_id
+                    self.db_manager.save_commentary_audio_history(
+                        ball_id=ball_id,
+                        match_id=match_id,
+                        audio_path=filepath,
+                        duration=tts_duration
+                    )
+                    logger.debug(f"Saved audio metadata to database: event_id={event_id}")
+                except Exception as e:
+                    logger.error(f"Failed to save audio to database: {e}")
+
+        except Exception as e:
+            logger.error(f"Error saving audio file: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # SHUTDOWN

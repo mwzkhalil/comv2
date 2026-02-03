@@ -30,11 +30,26 @@ class APIConfig:
     base_url: str = os.getenv("API_BASE_URL", "http://192.168.18.120:8000")
     booking_endpoint: str = "/bookings/get_booking_by_time/"
     innings_endpoint: str = "/innings/get_innings"
+    missed_events_endpoint: str = "/commentary/missed-events"
     timeout: int = int(os.getenv("API_TIMEOUT", "10"))
     use_dummy_mode: bool = os.getenv("USE_DUMMY_MODE", "true").lower() == "true"
     speak_only_deliveries: bool = os.getenv("SPEAK_ONLY_DELIVERIES", "true").lower() == "true"
-    # Use WebSocket streaming client for live events when enabled (default: false)
-    use_ws_streaming: bool = os.getenv("USE_WS_STREAMING", "false").lower() == "true"
+    # Use WebSocket streaming client for live events (now default and required)
+    use_ws_streaming: bool = os.getenv("USE_WS_STREAMING", "true").lower() == "true"
+
+
+@dataclass
+class WebSocketConfig:
+    """WebSocket connection configuration."""
+    ws_endpoint_template: str = "/ws/live-commentary/{match_id}"
+    ping_interval: int = 30  # seconds
+    ping_timeout: int = 10  # seconds
+    reconnect_backoff_initial: float = 1.0  # seconds
+    reconnect_backoff_max: float = 30.0  # seconds
+    reconnect_backoff_multiplier: float = 2.0
+    # Optional authentication
+    ws_auth_token: str = os.getenv("WS_AUTH_TOKEN", "")
+    ws_auth_header: str = "Authorization"
 
 
 @dataclass
@@ -53,6 +68,12 @@ class AudioConfig:
     sfx_channel: int = 1
     # Timeout (seconds) to wait for TTS streaming chunks before treating as failed
     tts_stream_timeout: int = int(os.getenv("AUDIO_TTS_TIMEOUT", "8"))
+    # Audio saving configuration
+    save_audio: bool = os.getenv("SAVE_AUDIO", "true").lower() == "true"
+    audio_storage_path: str = os.getenv("AUDIO_STORAGE_PATH", "./audio_history")
+    audio_format: str = os.getenv("AUDIO_FORMAT", "wav")  # wav, mp3
+    audio_sample_rate: int = 22050
+    audio_channels: int = 1
 
 
 @dataclass
@@ -77,15 +98,11 @@ class ElevenLabsConfig:
 
 
 @dataclass
-class PollingConfig:
-    """Polling intervals for various operations."""
-    deliveries_interval: float = 0.4
-    match_state_interval: float = 3.0
-    error_retry_interval: float = 5.0
-    innings_break_sleep: float = 8.0
-    match_end_sleep: float = 15.0
-    # Consider deliveries with a ball_timestamp within this many seconds as "recent".
-    deliveries_recent_seconds: int = int(os.getenv("DELIVERIES_RECENT_SECONDS", "10"))
+class QueueConfig:
+    """Event queue configuration."""
+    queue_timeout: float = 0.5  # seconds to wait for next event
+    max_queue_size: int = 1000  # maximum events in queue
+    event_processing_interval: float = 0.1  # seconds between event processing checks
 
 
 @dataclass
@@ -98,7 +115,8 @@ class MatchConfig:
 # Global configuration instances
 db_config = DatabaseConfig()
 api_config = APIConfig()
+ws_config = WebSocketConfig()
 audio_config = AudioConfig()
 tts_config = ElevenLabsConfig()
-polling_config = PollingConfig()
+queue_config = QueueConfig()
 match_config = MatchConfig()

@@ -1,12 +1,19 @@
+"""
+Indoor Cricket Live Commentary System - WebSocket Streaming Mode
+
+This system receives commentary events via WebSocket and plays them with TTS
+and persistent crowd SFX. All commentary text comes from the external system.
+"""
+
 import time
 import signal
 import sys
 import logging
 from typing import Optional
 
-from config import polling_config, api_config
+from config import api_config, queue_config, audio_config
 from audio_manager import AudioManager
-from commentary import CommentaryGenerator
+from commentary import CommentaryGenerator  # For intensity mapping only
 from state_manager import MatchStateManager
 from api_client import CricketAPIClient
 from database import DatabaseManager
@@ -27,15 +34,16 @@ logger = logging.getLogger(__name__)
 
 
 class CricketCommentator:
+    """Main commentator orchestrator - WebSocket streaming mode only."""
     
     def __init__(self):
-        logger.info("Initializing Cricket Commentator...")
+        logger.info("Initializing Cricket Commentator (WebSocket Streaming Mode)...")
         
         # Initialize components
         self.db = DatabaseManager()
         self.api = CricketAPIClient()
-        self.audio = AudioManager()
-        self.commentary_gen = CommentaryGenerator()
+        self.audio = AudioManager(db_manager=self.db)  # Pass DB for audio saving
+        self.commentary_gen = CommentaryGenerator()  # For intensity mapping only
         self.state_mgr = MatchStateManager()
         self.event_queue = EventQueue()
         self.ws_client = WSClient(self.event_queue)
@@ -43,293 +51,258 @@ class CricketCommentator:
         # Runtime control
         self.running = False
         
-        if api_config.use_dummy_mode:
-            logger.warning("RUNNING IN DUMMY MODE - Using mock API and Database data")
-            # In production, dummy mode should not be enabled
-        if api_config.speak_only_deliveries:
-            logger.info("DELIVERY-ONLY MODE - Speaking only database sentences")
+        # Metrics tracking
+        self.metrics = {
+            "events_received": 0,
+            "events_spoken": 0,
+            "events_skipped": 0,
+            "audio_latencies": []
+        }
+        
         logger.info("Cricket Commentator initialized")
     
     def setup(self) -> bool:
+        """Setup all subsystems."""
         logger.info("Setting up subsystems...")
         
+        # Test database connection (needed for audio history saving)
         if not self.db.test_connection():
-            logger.error("Database connection failed")
-            return False
+            logger.warning("Database connection failed - audio history saving disabled")
+        else:
+            logger.info("Database connection successful")
         
+        # Start persistent background SFX and audio engine
         if not self.audio.start_background_sfx():
             logger.warning("Background SFX not available, continuing without it")
         
         self.audio.start_playback_loop()
-        # Start WebSocket streaming client if configured
-        if api_config.use_ws_streaming:
-            # attempt an initial match poll to get match_id/slot
-            try:
-                self._poll_match()
+        logger.info("Audio engine started with persistent crowd SFX")
+        
+        # Attempt to get initial match_id for WebSocket subscription
+        try:
+            match_data = self.api.fetch_current_match()
+            if match_data:
                 state = self.state_mgr.get_state()
-                match_id = str(state.slot_id) if state.slot_id else None
+                state.update_from_api(match_data)
+                match_id = match_data.get("match_id") or match_data.get("slot_id") or state.slot_id
                 if match_id:
-                    self.ws_client.start(match_id=match_id)
+                    match_id_str = str(match_id)
+                    self.event_queue.set_match_id(match_id_str)
+                    self.ws_client.start(match_id=match_id_str)
+                    logger.info(f"WebSocket client subscribed to match: {match_id_str}")
                 else:
-                    logger.info("No active match to subscribe to yet; WS client will wait")
-            except Exception:
-                logger.exception("Failed to start WS client")
+                    logger.info("No active match found - WebSocket will start when match is available")
+            else:
+                logger.info("No match data available - WebSocket will start when match is available")
+        except Exception as e:
+            logger.warning(f"Failed to get initial match: {e} - will retry in main loop")
         
         logger.info("All subsystems ready")
         return True
     
     def run(self):
+        """Main event processing loop."""
         logger.info("=" * 60)
         logger.info("INDOOR CRICKET LIVE COMMENTATOR - STARTED")
-        logger.info("Database-Driven Commentary (sentence + intensity)")
-        logger.info("Using Deliveries Table")
-        if api_config.use_dummy_mode:
-            logger.info("MODE: TEST (Mock API Data)")
+        logger.info("Mode: WebSocket Streaming (No DB Polling)")
+        logger.info("Commentary: External System via WebSocket")
+        logger.info("Audio: TTS + Persistent Crowd SFX")
         logger.info("=" * 60)
         
         self.running = True
+        last_match_poll = 0
+        match_poll_interval = 30  # Poll for match changes every 30 seconds
         
         while self.running:
             try:
-                if not self._poll_match():
-                    time.sleep(polling_config.error_retry_interval)
-                    continue
+                # Periodically check for match changes (for WebSocket reconnection)
+                current_time = time.time()
+                if current_time - last_match_poll > match_poll_interval:
+                    self._check_match_status()
+                    last_match_poll = current_time
                 
-                state = self.state_mgr.get_state()
+                # Process events from WebSocket queue
+                self._process_stream_events()
                 
-                if not state.is_match_active():
-                    time.sleep(polling_config.match_state_interval)
-                    continue
-                
-                if not self._poll_innings():
-                    time.sleep(polling_config.error_retry_interval)
-                    continue
-                
-                self._handle_match_phase()
+                # Small sleep to prevent CPU spinning
+                time.sleep(queue_config.event_processing_interval)
                 
             except KeyboardInterrupt:
                 logger.info("Received shutdown signal")
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
-                time.sleep(polling_config.error_retry_interval)
+                time.sleep(1)  # Brief pause on error
         
         logger.info("Commentary loop stopped")
+        self._log_metrics()
     
-    def _poll_match(self) -> bool:
-        match_data = self.api.fetch_current_match()
-        if not match_data:
-            return False
-        
-        state = self.state_mgr.get_state()
-        is_new = state.update_from_api(match_data)
-        
-        if is_new:
-            logger.info(f"NEW MATCH: {state.team_one_name} vs {state.team_two_name}")
-            # If streaming is enabled, set match_id and (re)start WS client
-            if api_config.use_ws_streaming:
-                # backend may provide a uuid-style match_id, fall back to slot_id
-                match_identifier = match_data.get("match_id") or match_data.get("slot_id") or state.slot_id
-                try:
-                    self.event_queue.set_match_id(str(match_identifier) if match_identifier is not None else None)
-                    self.ws_client.start(match_id=str(match_identifier))
-                    logger.info(f"WS client subscribed to match {match_identifier}")
-                except Exception:
-                    logger.exception("Failed to start/subscribe WS client for new match")
-        
-        return True
-    
-    def _poll_innings(self) -> bool:
-        state = self.state_mgr.get_state()
-        
-        innings_data = self.api.fetch_innings_state(state.slot_id)
-        if not innings_data:
-            return False
-        
-        state.update_innings_status(innings_data)
-        return True
-    
-    def _handle_match_phase(self):
-        """Handle current match phase based on innings status."""
-        state = self.state_mgr.get_state()
-        
-        # Skip announcements if configured to speak only deliveries
-        if api_config.speak_only_deliveries:
-            # Only poll deliveries during live innings
-            if state.is_innings_live():
-                self._poll_deliveries()
-                time.sleep(polling_config.deliveries_interval)
-            else:
-                # Just mark announcements as done without speaking
-                if state.should_announce_welcome():
-                    state.mark_welcome_announced()
-                    logger.info("Skipping welcome announcement (speak_only_deliveries=True)")
-                elif state.should_announce_break():
-                    state.mark_break_announced()
-                    logger.info("Skipping innings break announcement (speak_only_deliveries=True)")
-                elif state.should_announce_end():
-                    state.mark_end_announced()
-                    logger.info("Skipping match end announcement (speak_only_deliveries=True)")
-                time.sleep(polling_config.match_state_interval)
-            return
-        
-        # Normal flow with all announcements
-        if state.should_announce_welcome():
-            self._announce_welcome()
-            time.sleep(polling_config.match_state_interval)
-        
-        elif state.is_innings_live():
-            if api_config.use_ws_streaming:
-                # Process any queued events from the stream
-                self._process_stream_events()
-                time.sleep(polling_config.deliveries_interval)
-            else:
-                self._poll_deliveries()
-                time.sleep(polling_config.deliveries_interval)
-        
-        elif state.should_announce_break():
-            self._announce_innings_break()
-            time.sleep(polling_config.innings_break_sleep)
-        
-        elif state.should_announce_end():
-            self._announce_match_end()
-            time.sleep(polling_config.match_end_sleep)
-        
-        else:
-            time.sleep(polling_config.match_state_interval)
-    
-    def _announce_welcome(self):
-        state = self.state_mgr.get_state()
-        text, excitement = self.commentary_gen.generate_welcome(
-            state.team_one_name,
-            state.team_two_name
-        )
-        # System announcements are highest priority (0)
+    def _check_match_status(self):
+        """Periodically check for match status changes."""
         try:
-            self.audio.default_priority = 0
-            self.audio.queue_commentary(text, excitement)
-        finally:
-            self.audio.default_priority = 2
-        state.mark_welcome_announced()
-        logger.info("Welcome announcement queued")
+            match_data = self.api.fetch_current_match()
+            if not match_data:
+                return
+            
+            state = self.state_mgr.get_state()
+            is_new = state.update_from_api(match_data)
+            
+            if is_new:
+                logger.info(f"NEW MATCH: {state.team_one_name} vs {state.team_two_name}")
+            
+            # Update WebSocket subscription if match_id changed
+            match_id = match_data.get("match_id") or match_data.get("slot_id") or state.slot_id
+            if match_id:
+                match_id_str = str(match_id)
+                current_match_id = self.event_queue.match_id
+                if match_id_str != current_match_id:
+                    logger.info(f"Match ID changed: {current_match_id} -> {match_id_str}")
+                    self.event_queue.set_match_id(match_id_str)
+                    self.ws_client.start(match_id=match_id_str)
+        except Exception as e:
+            logger.debug(f"Error checking match status: {e}")
     
-    def _announce_innings_break(self):
-        """Announce innings break."""
-        state = self.state_mgr.get_state()
-        text, excitement = self.commentary_gen.generate_innings_break()
-        try:
-            self.audio.default_priority = 0
-            self.audio.queue_commentary(text, excitement)
-        finally:
-            self.audio.default_priority = 2
-        state.mark_break_announced()
-        logger.info("Innings break announcement queued")
-    
-    def _announce_match_end(self):
-        """Announce match end with winner."""
-        state = self.state_mgr.get_state()
-        winner = state.get_winner_name()
-        text, excitement = self.commentary_gen.generate_match_end(winner)
-        try:
-            self.audio.default_priority = 0
-            self.audio.queue_commentary(text, excitement)
-        finally:
-            self.audio.default_priority = 2
-        state.mark_end_announced()
-        logger.info(f"Match end announcement queued - Winner: {winner}")
-    
-    def _poll_deliveries(self):
-        """Poll and process new ball deliveries."""
-        state = self.state_mgr.get_state()
-        
-        deliveries = self.db.get_new_deliveries(
-            state.last_seen_event_id,
-            state.slot_id,
-            state.last_seen_ball_timestamp
-        )
-        
-        for delivery in deliveries:
-            event_id = delivery.get("event_id")
-            
-            # Get commentary from database sentence field
-            commentary_text, excitement = self.commentary_gen.generate(delivery)
-            
-            # Queue for playback
-            self.audio.queue_commentary(commentary_text, excitement)
-            
-            # Update state
-            state.update_last_event_id(event_id)
-            # Update last seen timestamp from DB delivered value
-            ts = delivery.get("ball_timestamp")
-            state.update_last_seen_timestamp(ts)
-            
-            logger.info(
-                f"Ball #{event_id}: {commentary_text} "
-                f"(intensity={delivery.get('intensity')}, excitement={excitement})"
-            )
-
     def _process_stream_events(self):
-        """Consume events from the in-memory event queue (WebSocket stream)."""
-        while True:
-            ev = self.event_queue.get_next(timeout=0.2)
+        """Process events from WebSocket queue.
+        
+        Event payload format:
+        {
+            "event_id": "<uuid>",
+            "match_id": "<uuid>",
+            "batsman_name": "<string>",
+            "sentences": "<string>",  # Authoritative commentary text
+            "intensity": "<low|normal|medium|high|extreme>"
+        }
+        """
+        processed_count = 0
+        max_per_iteration = 10  # Process up to 10 events per iteration
+        
+        while processed_count < max_per_iteration:
+            ev = self.event_queue.get_next(timeout=queue_config.queue_timeout)
             if not ev:
                 break
-
-            # Event payload authoritative: sentences must be used as-is
-            text = ev.get("sentences") or ""
-            # Simple excitement heuristic (can be refined)
-            excitement = 5 if "ANNOUNCEMENT" in (text or "").upper() else 3
-
-            # Determine priority similar to EventQueue
-            bid = ev.get("ball_detection_id") or ""
-            parts = bid.split("_")
-            ev_type = parts[2].lower() if len(parts) >= 3 else None
-            if ev_type in ("announcement", "system"):
-                priority = 0
-            elif ev_type in ("wicket", "special"):
-                priority = 1
-            else:
-                priority = 2
-
-            # Use audio default_priority temporarily to pass priority through
-            try:
-                self.audio.default_priority = priority
-                self.audio.queue_commentary(text, excitement)
-            finally:
-                self.audio.default_priority = 2
-
-            if bid:
-                self.event_queue.mark_processed(bid)
-                logger.info(f"Spoken event {bid}: {text[:80]}")
+            
+            self.metrics["events_received"] += 1
+            event_id = ev.get("event_id")
+            
+            if not event_id:
+                logger.warning("Event missing event_id, skipping")
+                continue
+            
+            # Extract commentary text (authoritative - do not modify)
+            text = ev.get("sentences", "").strip()
+            if not text:
+                logger.warning(f"Event {event_id} has empty sentences, skipping")
+                self.event_queue.mark_processed(event_id)
+                self.metrics["events_skipped"] += 1
+                continue
+            
+            # Map intensity to excitement level
+            intensity = ev.get("intensity", "normal").lower().strip()
+            excitement = self.commentary_gen.INTENSITY_MAP.get(intensity, 5)
+            
+            # Determine priority (EventQueue already determined, but we can override)
+            priority = ev.get("priority")
+            if priority is None:
+                # Fallback priority determination
+                sentences_upper = text.upper()
+                if any(kw in sentences_upper for kw in ["ANNOUNCEMENT", "WELCOME", "BREAK", "END", "SYSTEM"]):
+                    priority = 0
+                elif any(kw in sentences_upper for kw in ["WICKET", "OUT", "BOWLED", "CAUGHT", "SPECIAL"]):
+                    priority = 1
+                else:
+                    priority = 2
+            
+            # Queue for playback with metadata
+            event_start_time = time.time()
+            self.audio.queue_commentary(
+                text=text,
+                excitement=excitement,
+                priority=priority,
+                event_id=event_id,
+                match_id=ev.get("match_id"),
+                batsman_name=ev.get("batsman_name"),
+                intensity=intensity
+            )
+            
+            # Mark as processed
+            self.event_queue.mark_processed(event_id)
+            self.metrics["events_spoken"] += 1
+            
+            # Calculate latency (event received -> queued)
+            latency_ms = (time.time() - event_start_time) * 1000
+            self.metrics["audio_latencies"].append(latency_ms)
+            if len(self.metrics["audio_latencies"]) > 1000:
+                self.metrics["audio_latencies"] = self.metrics["audio_latencies"][-1000:]
+            
+            logger.info(
+                f"Event processed: event_id={event_id}, "
+                f"intensity={intensity}, excitement={excitement}, "
+                f"priority={priority}, latency={latency_ms:.1f}ms, "
+                f"text={text[:60]}..."
+            )
+            
+            processed_count += 1
+    
+    def _log_metrics(self):
+        """Log final metrics summary."""
+        if self.metrics["audio_latencies"]:
+            avg_latency = sum(self.metrics["audio_latencies"]) / len(self.metrics["audio_latencies"])
+            max_latency = max(self.metrics["audio_latencies"])
+            min_latency = min(self.metrics["audio_latencies"])
+        else:
+            avg_latency = max_latency = min_latency = 0
+        
+        logger.info("=" * 60)
+        logger.info("METRICS SUMMARY")
+        logger.info(f"Events received: {self.metrics['events_received']}")
+        logger.info(f"Events spoken: {self.metrics['events_spoken']}")
+        logger.info(f"Events skipped: {self.metrics['events_skipped']}")
+        logger.info(f"Audio latency - avg: {avg_latency:.1f}ms, min: {min_latency:.1f}ms, max: {max_latency:.1f}ms")
+        logger.info(f"Queue size: {self.event_queue.get_queue_size()}")
+        logger.info("=" * 60)
     
     def shutdown(self):
         """Graceful shutdown of all subsystems."""
         logger.info("Shutting down commentator...")
         self.running = False
         
-        # Stop audio
-        self.audio.stop()
-        # Stop websocket client
+        # Stop WebSocket client
         try:
             self.ws_client.stop()
-        except Exception:
-            pass
+            logger.info("WebSocket client stopped")
+        except Exception as e:
+            logger.error(f"Error stopping WebSocket client: {e}")
+        
+        # Stop audio (this will finish current playback)
+        try:
+            self.audio.stop()
+            logger.info("Audio engine stopped")
+        except Exception as e:
+            logger.error(f"Error stopping audio engine: {e}")
         
         # Close API client
-        self.api.close()
+        try:
+            self.api.close()
+        except Exception as e:
+            logger.error(f"Error closing API client: {e}")
+        
+        # Log final metrics
+        self._log_metrics()
         
         logger.info("Commentator shutdown complete")
 
 
 def signal_handler(sig, frame):
-    """Handle shutdown signals."""
-    logger.info("\nReceived interrupt signal, shutting down...")
+    """Handle shutdown signals gracefully."""
+    logger.info("\nReceived interrupt signal, shutting down gracefully...")
+    # The main loop will handle cleanup via shutdown()
     sys.exit(0)
 
 
 def main():
     """Main entry point."""
-    # Setup signal handlers
+    # Setup signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
@@ -344,6 +317,7 @@ def main():
         commentator.run()
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         commentator.shutdown()
 
