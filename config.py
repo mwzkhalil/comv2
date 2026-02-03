@@ -33,6 +33,8 @@ class APIConfig:
     timeout: int = int(os.getenv("API_TIMEOUT", "10"))
     use_dummy_mode: bool = os.getenv("USE_DUMMY_MODE", "true").lower() == "true"
     speak_only_deliveries: bool = os.getenv("SPEAK_ONLY_DELIVERIES", "true").lower() == "true"
+    # Use WebSocket streaming client for live events when enabled (default: false)
+    use_ws_streaming: bool = os.getenv("USE_WS_STREAMING", "false").lower() == "true"
 
 
 @dataclass
@@ -49,6 +51,8 @@ class AudioConfig:
     mixer_channels: int = 2
     commentary_channel: int = 0
     sfx_channel: int = 1
+    # Timeout (seconds) to wait for TTS streaming chunks before treating as failed
+    tts_stream_timeout: int = int(os.getenv("AUDIO_TTS_TIMEOUT", "8"))
 
 
 @dataclass

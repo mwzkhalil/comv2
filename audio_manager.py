@@ -52,11 +52,14 @@ class AudioManager:
         self.bg_volume = self.config.background_volume
         self.target_bg_volume = self.bg_volume
 
-        # Commentary queue
-        self.audio_queue: queue.Queue[Iterable[bytes]] = queue.Queue()
+        # Commentary queue (priority queue: lower number = higher priority)
+        # Tuple: (priority, counter, enqueue_ts, stream)
+        self.audio_queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._aq_counter = 0
 
         # TTS buffer for streaming playback
         self.tts_buffer = np.zeros(0, dtype=np.float32)
+        self._current_priority: Optional[int] = None
 
         # Playback state
         self.stop_event = threading.Event()
@@ -105,10 +108,21 @@ class AudioManager:
     # COMMENTARY QUEUE
     # ------------------------------------------------------------------
     def queue_commentary(self, text: str, excitement: int = 0):
+        """Queue commentary for playback with optional priority.
+
+        Priority: lower integer means higher priority. Default priority is 2 (normal).
+        """
         stream = self.generate_tts_stream(text, excitement)
-        if stream:
-            self.audio_queue.put(stream)
-            logger.info(f"Queued commentary: {text[:60]}...")
+        if not stream:
+            return
+
+        # Default priority choices could be refined by caller
+        priority = getattr(self, "default_priority", 2)
+        self._aq_counter += 1
+        enqueue_ts = time.time()
+        # Store enqueue timestamp for latency metrics and the stream object
+        self.audio_queue.put((priority, self._aq_counter, enqueue_ts, stream))
+        logger.info(f"Queued commentary (prio={priority}): {text[:60]}...")
 
     # ------------------------------------------------------------------
     # BACKGROUND / PLAYBACK COMPATIBILITY
@@ -180,24 +194,71 @@ class AudioManager:
         ):
             while not self.stop_event.is_set():
                 try:
-                    tts_stream = self.audio_queue.get(timeout=0.2)
+                    item = self.audio_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
 
+                # item is (priority, counter, enqueue_ts, stream)
+                priority, _cnt, enqueue_ts, tts_stream = item
+
+                # Log enqueue->start latency
+                latency = time.time() - enqueue_ts
+                logger.info(f"Audio queue latency: {latency:.3f}s (prio={priority})")
+
                 self._duck_background(True)
 
+                # Collect PCM chunks from streaming generator in a worker thread
+                pcm_raw_chunks = []
+
+                def _collect():
+                    try:
+                        for chunk in tts_stream:
+                            if self.stop_event.is_set():
+                                break
+                            if not isinstance(chunk, bytes):
+                                continue
+                            pcm_raw_chunks.append(chunk)
+                    except Exception as e:
+                        logger.error(f"Error while collecting TTS stream: {e}")
+
+                collector = threading.Thread(target=_collect, daemon=True)
+                collector.start()
+
+                # Wait up to configured timeout for TTS to finish/produce data
+                timeout = getattr(self.config, "tts_stream_timeout", 8)
+                collector.join(timeout=timeout)
+
+                if collector.is_alive():
+                    logger.warning(f"TTS stream timed out after {timeout}s (prio={priority})")
+                    # We won't attempt to forcibly close underlying stream; proceed with collected data
+
+                if not pcm_raw_chunks:
+                    logger.error("No audio received from TTS stream; skipping event")
+                    # restore background ducking state
+                    self._duck_background(False)
+                    continue
+
+                # Convert raw PCM byte chunks into float32 arrays and concatenate
                 pcm_chunks = []
-                for chunk in tts_stream:
-                    if self.stop_event.is_set():
-                        break
-                    if not isinstance(chunk, bytes):
-                        continue
+                for chunk in pcm_raw_chunks:
                     audio = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
                     audio /= 32768.0
                     pcm_chunks.append(audio)
 
-                if pcm_chunks:
-                    self.tts_buffer = np.concatenate(pcm_chunks)
+                new_buffer = np.concatenate(pcm_chunks)
+
+                # If something is already playing, decide whether to preempt
+                if self.tts_buffer.size > 0 and self._current_priority is not None:
+                    # Preempt if incoming has higher priority (lower number)
+                    if priority < self._current_priority:
+                        self.tts_buffer = new_buffer
+                        self._current_priority = priority
+                    else:
+                        # Append after current buffer
+                        self.tts_buffer = np.concatenate((self.tts_buffer, new_buffer))
+                else:
+                    self.tts_buffer = new_buffer
+                    self._current_priority = priority
 
     # ------------------------------------------------------------------
     # DUCKING

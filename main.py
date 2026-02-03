@@ -10,6 +10,8 @@ from commentary import CommentaryGenerator
 from state_manager import MatchStateManager
 from api_client import CricketAPIClient
 from database import DatabaseManager
+from event_queue import EventQueue
+from ws_client import WSClient
 
 # Configure logging
 logging.basicConfig(
@@ -35,15 +37,17 @@ class CricketCommentator:
         self.audio = AudioManager()
         self.commentary_gen = CommentaryGenerator()
         self.state_mgr = MatchStateManager()
+        self.event_queue = EventQueue()
+        self.ws_client = WSClient(self.event_queue)
         
         # Runtime control
         self.running = False
         
         if api_config.use_dummy_mode:
-            logger.warning("⚠️  RUNNING IN DUMMY MODE - Using mock API and Database data")
+            logger.warning("RUNNING IN DUMMY MODE - Using mock API and Database data")
             # In production, dummy mode should not be enabled
         if api_config.speak_only_deliveries:
-            logger.info("📢 DELIVERY-ONLY MODE - Speaking only database sentences")
+            logger.info("DELIVERY-ONLY MODE - Speaking only database sentences")
         logger.info("Cricket Commentator initialized")
     
     def setup(self) -> bool:
@@ -57,6 +61,19 @@ class CricketCommentator:
             logger.warning("Background SFX not available, continuing without it")
         
         self.audio.start_playback_loop()
+        # Start WebSocket streaming client if configured
+        if api_config.use_ws_streaming:
+            # attempt an initial match poll to get match_id/slot
+            try:
+                self._poll_match()
+                state = self.state_mgr.get_state()
+                match_id = str(state.slot_id) if state.slot_id else None
+                if match_id:
+                    self.ws_client.start(match_id=match_id)
+                else:
+                    logger.info("No active match to subscribe to yet; WS client will wait")
+            except Exception:
+                logger.exception("Failed to start WS client")
         
         logger.info("All subsystems ready")
         return True
@@ -67,7 +84,7 @@ class CricketCommentator:
         logger.info("Database-Driven Commentary (sentence + intensity)")
         logger.info("Using Deliveries Table")
         if api_config.use_dummy_mode:
-            logger.info("🧪 MODE: DUMMY/TEST (Mock API Data)")
+            logger.info("MODE: TEST (Mock API Data)")
         logger.info("=" * 60)
         
         self.running = True
@@ -109,6 +126,16 @@ class CricketCommentator:
         
         if is_new:
             logger.info(f"NEW MATCH: {state.team_one_name} vs {state.team_two_name}")
+            # If streaming is enabled, set match_id and (re)start WS client
+            if api_config.use_ws_streaming:
+                # backend may provide a uuid-style match_id, fall back to slot_id
+                match_identifier = match_data.get("match_id") or match_data.get("slot_id") or state.slot_id
+                try:
+                    self.event_queue.set_match_id(str(match_identifier) if match_identifier is not None else None)
+                    self.ws_client.start(match_id=str(match_identifier))
+                    logger.info(f"WS client subscribed to match {match_identifier}")
+                except Exception:
+                    logger.exception("Failed to start/subscribe WS client for new match")
         
         return True
     
@@ -152,8 +179,13 @@ class CricketCommentator:
             time.sleep(polling_config.match_state_interval)
         
         elif state.is_innings_live():
-            self._poll_deliveries()
-            time.sleep(polling_config.deliveries_interval)
+            if api_config.use_ws_streaming:
+                # Process any queued events from the stream
+                self._process_stream_events()
+                time.sleep(polling_config.deliveries_interval)
+            else:
+                self._poll_deliveries()
+                time.sleep(polling_config.deliveries_interval)
         
         elif state.should_announce_break():
             self._announce_innings_break()
@@ -172,7 +204,12 @@ class CricketCommentator:
             state.team_one_name,
             state.team_two_name
         )
-        self.audio.queue_commentary(text, excitement)
+        # System announcements are highest priority (0)
+        try:
+            self.audio.default_priority = 0
+            self.audio.queue_commentary(text, excitement)
+        finally:
+            self.audio.default_priority = 2
         state.mark_welcome_announced()
         logger.info("Welcome announcement queued")
     
@@ -180,7 +217,11 @@ class CricketCommentator:
         """Announce innings break."""
         state = self.state_mgr.get_state()
         text, excitement = self.commentary_gen.generate_innings_break()
-        self.audio.queue_commentary(text, excitement)
+        try:
+            self.audio.default_priority = 0
+            self.audio.queue_commentary(text, excitement)
+        finally:
+            self.audio.default_priority = 2
         state.mark_break_announced()
         logger.info("Innings break announcement queued")
     
@@ -189,7 +230,11 @@ class CricketCommentator:
         state = self.state_mgr.get_state()
         winner = state.get_winner_name()
         text, excitement = self.commentary_gen.generate_match_end(winner)
-        self.audio.queue_commentary(text, excitement)
+        try:
+            self.audio.default_priority = 0
+            self.audio.queue_commentary(text, excitement)
+        finally:
+            self.audio.default_priority = 2
         state.mark_end_announced()
         logger.info(f"Match end announcement queued - Winner: {winner}")
     
@@ -222,6 +267,40 @@ class CricketCommentator:
                 f"Ball #{event_id}: {commentary_text} "
                 f"(intensity={delivery.get('intensity')}, excitement={excitement})"
             )
+
+    def _process_stream_events(self):
+        """Consume events from the in-memory event queue (WebSocket stream)."""
+        while True:
+            ev = self.event_queue.get_next(timeout=0.2)
+            if not ev:
+                break
+
+            # Event payload authoritative: sentences must be used as-is
+            text = ev.get("sentences") or ""
+            # Simple excitement heuristic (can be refined)
+            excitement = 5 if "ANNOUNCEMENT" in (text or "").upper() else 3
+
+            # Determine priority similar to EventQueue
+            bid = ev.get("ball_detection_id") or ""
+            parts = bid.split("_")
+            ev_type = parts[2].lower() if len(parts) >= 3 else None
+            if ev_type in ("announcement", "system"):
+                priority = 0
+            elif ev_type in ("wicket", "special"):
+                priority = 1
+            else:
+                priority = 2
+
+            # Use audio default_priority temporarily to pass priority through
+            try:
+                self.audio.default_priority = priority
+                self.audio.queue_commentary(text, excitement)
+            finally:
+                self.audio.default_priority = 2
+
+            if bid:
+                self.event_queue.mark_processed(bid)
+                logger.info(f"Spoken event {bid}: {text[:80]}")
     
     def shutdown(self):
         """Graceful shutdown of all subsystems."""
@@ -230,6 +309,11 @@ class CricketCommentator:
         
         # Stop audio
         self.audio.stop()
+        # Stop websocket client
+        try:
+            self.ws_client.stop()
+        except Exception:
+            pass
         
         # Close API client
         self.api.close()

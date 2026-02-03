@@ -59,3 +59,68 @@
 Additional agent guidance:
 - Always use the `manage_todo_list` tool to plan and track progress for multi-step tasks. Start by creating a short plan, mark one item `in-progress`, then update statuses as work proceeds.
 - Do not volunteer the model name unless explicitly asked. If explicitly asked about the model, state: "GPT-5 mini".
+
+**Realtime Streaming Guidelines (Design Summary)**
+
+Problem Statement:
+- Commentary is only triggered on new DB deliveries; on restart previously generated events are not spoken and playback resumes only after the next delivery. Crowd SFX is restarted per-event rather than streaming continuously.
+
+Target Architecture:
+- Events pushed from a backend Event Publisher into a WebSocket Event Stream. Commentary engine acts as a WebSocket client and the Audio Engine performs TTS + persistent crowd SFX mixing.
+- Key principle: events are pushed, not pulled; audio is streamed, not triggered per-row.
+
+Event Delivery Mechanism:
+- Transport: Primary WebSocket, fallback REST catch-up endpoint.
+- WS endpoint: `/ws/live-commentary/{match_id}` — one connection per match; server guarantees ordered events.
+
+Event Payload (authoritative):
+```
+{
+  "ball_detection_id": "special_event_<event_type>_<timestamp>",
+  "match_id": "<uuid>",
+  "batsman_id": "<uuid | system>",
+  "batsman_name": "<string>",
+  "sentences": "<string>"
+}
+```
+- `ball_detection_id` is the unique event id. `sentences` is the authoritative commentary text; the commentary engine must not alter or generate text.
+
+Commentary Engine (Python) changes:
+- Replace DB polling with a WebSocket client that subscribes to `match_id` on startup and enqueues received events into an in-memory FIFO.
+- Add a new module `event_queue.py` to deduplicate by `ball_detection_id`, block overlapping commentary, enforce priority rules, and acknowledge processed events.
+- Restart safety: persist `last_spoken_ball_detection_id` in `state/runtime_state.json`; on reconnect call REST `GET /commentary/missed-events?match_id=...&after_id=...` to enqueue missed events before resuming WS streaming.
+
+Audio System changes:
+- Start persistent crowd SFX once at app startup and loop continuously; do not restart per event.
+- For each event: duck crowd audio, synthesize TTS from `sentences`, play TTS, then restore crowd volume.
+- Enforce audio priority: System announcements > Wickets/Special > Normal ball events; queue manager may reorder by priority.
+
+State and Backend responsibilities:
+- Persist runtime state in `state/runtime_state.json`:
+  ```json
+  {
+    "match_id": "<uuid>",
+    "last_spoken_ball_detection_id": "<string>",
+    "last_update": "<timestamp>"
+  }
+  ```
+- Backend must publish exactly-once, in chronological order, and provide a REST missed-events endpoint for reconnects.
+
+Failure handling & monitoring:
+- Auto-reconnect WS with exponential backoff and request missed events using the last-spoken id.
+- On audio failure, skip after timeout and continue streaming; log `event received`, `event spoken`, `event skipped (duplicate)`, and audio latency per event.
+- Metrics to track: ball→commentary latency, queue depth, audio overlap errors.
+
+Implementation phases:
+- Phase 1: Backend streaming (WS + missed-events REST).
+- Phase 2: Commentary engine (WS client, `event_queue.py`, restart safe state).
+- Phase 3: Audio refactor (persistent crowd loop, ducking controller, non-blocking TTS).
+- Phase 4: Testing (restart during live match, network drop recovery, high-frequency bursts).
+
+Non-goals (explicit):
+- No commentary text generation in Python.
+- No DB polling for live events.
+- No crowd audio restart per delivery.
+- No hardcoded commentary logic.
+
+Final outcome: The system will speak every event immediately, resume cleanly after restarts, and maintain continuous crowd ambience to behave like a live broadcast rather than a scripted reader.
