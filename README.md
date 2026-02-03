@@ -1,46 +1,121 @@
 # Indoor Cricket Live Commentary System
 
-Real-time cricket match commentator that generates live audio commentary with crowd sound effects using pre-generated commentary from the database.
+Real-time cricket match commentator that receives live commentary events via WebSocket and plays them with TTS (ElevenLabs) and persistent crowd sound effects. All commentary text is provided by an external system via WebSocket.
 
 ## Features
 
-- **Commentary** - Uses pre-generated commentary from MySQL `sentence` field
-- **Audio Streaming** - In-memory TTS playback (no disk writes for better performance)
-- **Background SFX** - Automatic crowd sound effects with smart ducking
-- **MySQL Integration** - Polls live match data from Deliveries table
-- **Intensity-Based Dynamics** - Voice modulation based on database `intensity` field (low/normal/medium/high/extreme)
+- **WebSocket Streaming** - Real-time event reception via WebSocket (no database polling)
+- **TTS Playback** - ElevenLabs streaming TTS with emotion/intensity mapping
+- **Persistent Crowd SFX** - Continuous background audio that never restarts per event
+- **Smart Ducking** - Background audio automatically ducks during commentary
+- **Priority Queue** - System announcements > Wickets/Special > Normal events
+- **Audio Saving** - Generated audio (TTS + SFX) saved to disk and database
+- **Restart-Safe** - Automatic missed events catch-up on reconnect
+- **Low Latency** - Non-blocking audio processing with real-time streaming
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  API Client │────▶│ State Manager│────▶│  Database   │
-└─────────────┘     └──────────────┘     └─────────────┘
-       │                    │                    │
-       ▼                    ▼                    ▼
-┌─────────────────────────────────────────────────────┐
-│              Main Commentator Loop                  |
-└─────────────────────────────────────────────────────┘
-       │                    │                    │
-       ▼                    ▼                    ▼
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│ Commentary  │────▶│ Audio Manager│────▶│  Speakers   │
-│  Generator  │     │  (Streaming) │     │             │
-└─────────────┘     └──────────────┘     └─────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│              External Commentary System                     │
+│              (Event Publisher)                              │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ WebSocket
+                       │ /ws/live-commentary/{match_id}
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Commentary Engine (This System)                │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
+│  │ WebSocket    │───▶│ Event Queue  │───▶│ Audio        │   │
+│  │ Client       │    │ (Priority +  │    │ Manager      │   │
+│  │              │    │  Dedupe)     │    │ (TTS + SFX)  │   │
+│  └──────────────┘    └──────────────┘    └──────────────┘   │
+│         │                    │                    │         │
+│         │                    │                    ▼         │
+│         │                    │            ┌──────────────┐  │
+│         │                    │            │   Speakers   │  │
+│         │                    │            └──────────────┘  │
+│         │                    │                              │
+│         │                    ▼                              │
+│         │            ┌──────────────┐                       │
+│         │            │ Runtime State│                       │
+│         │            │ (Persisted)  │                       │
+│         │            └──────────────┘                       │
+│         │                                                   │
+│         └───────────▶ Database (Audio History Only)         │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+## Key Components
+
+- **`main.py`** - Main orchestrator, event processing loop, metrics tracking
+- **`ws_client.py`** - WebSocket client with auto-reconnect and missed events catch-up
+- **`event_queue.py`** - Priority queue with deduplication and state persistence
+- **`audio_manager.py`** - TTS streaming, crowd SFX mixing, ducking, audio saving
+- **`config.py`** - Centralized configuration (no hardcoding elsewhere)
+- **`database.py`** - Database operations (audio history saving only)
+- **`commentary.py`** - Intensity → excitement mapping (no text generation)
+- **`state_manager.py`** - Match state tracking (teams, innings status)
+- **`api_client.py`** - Backend API client (match status checking)
+
+## Event Payload Structure
+
+All events from the external system must conform to this schema:
+
+```json
+{
+  "event_id": "<uuid>",
+  "match_id": "<uuid>",
+  "batsman_name": "<string>",
+  "sentences": "<string>",
+  "intensity": "<low|normal|medium|high|extreme>"
+}
+```
+
+**Field Descriptions:**
+- `event_id`: Unique event identifier (used for deduplication)
+- `match_id`: Match identifier
+- `batsman_name`: Batsman name (optional, for metadata)
+- `sentences`: **Authoritative commentary text** (must not be modified)
+- `intensity`: Voice emotion level (maps to TTS excitement)
+
+**⚠️ Important:** The `sentences` field is the single source of commentary text. The system does NOT generate or modify commentary text.
+
+## Priority System
+
+Events are processed in priority order:
+
+- **Priority 0** (Highest): System announcements (welcome, break, end)
+- **Priority 1** (High): Wickets and special events
+- **Priority 2** (Normal): Regular ball events
+
+Higher priority events preempt lower priority playback.
+
+## Intensity Mapping
+
+The `intensity` field maps to TTS voice excitement:
+
+| Intensity | Excitement | Voice Characteristics |
+|-----------|------------|----------------------|
+| `low` | 2 | Calm, stable voice |
+| `normal` | 5 | Standard voice |
+| `medium` | 7 | Engaged voice |
+| `high` | 9 | Excited voice |
+| `extreme` | 10 | Maximum excitement |
 
 ## Installation
 
 ### Prerequisites
+
 - Python 3.8+
-- MySQL database
-- ffmpeg (for audio conversion)
+- MySQL database (for audio history saving)
+- ffmpeg (for audio processing, optional)
 
 ### Setup
 
 ```bash
 # Clone/navigate to project directory
-cd cricket_comp
+cd comv2
 
 # Install Python dependencies
 pip install -r requirements.txt
@@ -51,193 +126,169 @@ sudo apt-get install ffmpeg
 # Or macOS
 brew install ffmpeg
 
+# Create directories
+mkdir -p background_audio audio_history state
+
 # Place crowd SFX file
-mkdir -p downloads
-# Add crowd_of.wav to downloads/ directory
+# Add crowd_of_22050.wav to background_audio/ directory
 ```
 
 ## Configuration
 
-Edit [config.py](config.py) to customize:
+### Environment Variables
 
-- **Database credentials** - MySQL connection settings
-- **API endpoints** - Backend server URLs
-- **Audio settings** - Volume levels, sampling rates
-- **ElevenLabs API** - TTS voice and model settings
-- **Match timing** - Default time slot (currently 21:00)
+Create a `.env` file or set environment variables:
 
-## Database Schema
+```bash
+# Backend API
+API_BASE_URL=http://192.168.18.120:8000
 
-The system reads from the `Deliveries` table with the following key fields:
+# WebSocket (required)
+USE_WS_STREAMING=true  # Default: true
 
-```sql
-mysql> DESCRIBE Deliveries;
-+----------------+---------------+
-| Field          | Type          |
-+----------------+---------------+
-| event_id       | int(11)       | -- Auto-increment, primary key
-| ball_id        | varchar(36)   | -- UUID
-| match_id       | varchar(36)   | -- UUID, links to match
-| batsman_id     | varchar(36)   | -- UUID
-| runs_scored    | int(11)       | -- -1 for wicket, 0-6 for runs
-| sentence       | text          | -- Pre-generated commentary (PRIMARY SOURCE)
-| intensity      | varchar(20)   | -- low/normal/medium/high/extreme
-| ball_timestamp | datetime      |
-| createdAt      | datetime      |
-+----------------+---------------+
+# TTS (ElevenLabs)
+ELEVENLABS_API_KEY=your_api_key_here
+ELEVENLABS_VOICE_ID=PSk5GhCjavRcRMo6NtjK
+
+# Audio Settings
+SAVE_AUDIO=true  # Save audio files (default: true)
+AUDIO_STORAGE_PATH=./audio_history  # Where to save audio files
+AUDIO_FORMAT=wav  # wav or mp3
+AUDIO_TTS_TIMEOUT=8  # TTS stream timeout in seconds
+
+# Database (for audio history)
+MYSQL_HOST=192.168.18.120
+MYSQL_PORT=3306
+MYSQL_USER=mahwiz
+MYSQL_PASSWORD=your_password
+MYSQL_DATABASE=IndoorCricket
+
+# WebSocket Authentication (optional)
+WS_AUTH_TOKEN=your_token_here
 ```
 
-**Commentary Source**: The `sentence` field contains pre-generated commentary text. The `intensity` field controls voice excitement:
-- `low` → Calm voice (excitement level 2)
-- `normal` → Standard voice (excitement level 5)
-- `medium` → Engaged voice (excitement level 7)
-- `high` → Excited voice (excitement level 9)
-- `extreme` → Maximum excitement (excitement level 10)
-
-**Fallback**: If `sentence` is empty/null, the system falls back to built-in templates based on `runs_scored`.
+All configuration defaults are defined in `config.py`. **Never hardcode configuration values elsewhere.**
 
 ## Usage
 
-### Run the commentator
+### Run the Commentator
 
 ```bash
+# Set required environment variables
+export API_BASE_URL="http://your.backend:8000"
+export ELEVENLABS_API_KEY="your_key"
+
+# Run
 python main.py
 ```
-# Indoor Cricket Live Commentary System
 
-Real-time cricket match commentator that generates live audio commentary with crowd sound effects using pre-generated commentary from the database — now with a realtime WebSocket streaming mode for low-latency live audio.
+### Logs
 
-## Highlights
-- Push-based live events over WebSocket (recommended) with REST catch-up for reconnects
-- Persistent crowd SFX loop with smart ducking during TTS playback
-- Priority-aware commentary queue (system announcements > wickets/special > normal)
-- Restart-safe runtime state persisted to `state/runtime_state.json`
-- Non-blocking TTS streaming with configurable timeouts and latency logging
+- **Console**: INFO level logging
+- **File**: `cricket_commentary.log` (detailed logging)
 
-## Architecture (high level)
+### Metrics
 
-Source → Backend Event Publisher → WebSocket Event Stream → Commentary Engine → Audio Engine (TTS + crowd SFX)
-
-Key components
-- `main.py` — orchestrator and main loop
-- `config.py` — all configuration and environment flags
-- `api_client.py` — backend API helper (bookings, innings)
-- `database.py` — legacy polling-based DB helper (still used in non-streaming mode)
-- `event_queue.py` — in-memory priority queue with dedup and persisted runtime state
-- `ws_client.py` — WebSocket client subscribing to `/ws/live-commentary/{match_id}` and fetching missed events
-- `audio_manager.py` — priority-aware audio engine with TTS streaming and persistent crowd SFX
-- `state/runtime_state.json` — runtime file used to store `match_id` and `last_spoken_ball_detection_id`
-
-## Event Schema (Authoritative)
-All events published by the backend MUST conform to this schema. The `sentences` field is the single source of commentary text — the commentary engine must not alter or generate text.
-
-```json
-{
-       "ball_detection_id": "special_event_<event_type>_<timestamp>",
-       "match_id": "<uuid>",
-       "batsman_id": "<uuid | system>",
-       "batsman_name": "<string>",
-       "sentences": "<string>"
-}
-```
-- `ball_detection_id`: unique event id (used for dedupe + ACK)
-- `sentences`: authoritative commentary text (do not modify)
-
-Event priority (determined by `ball_detection_id` type):
-- System/Announcement → Highest (0)
-- Wicket / Special → High (1)
-- Normal ball events → Normal (2)
-
-## Realtime Streaming vs Polling
-- Streaming (recommended): Enable WebSocket streaming with `USE_WS_STREAMING=true` and the app will subscribe to `ws://<API>/ws/live-commentary/{match_id}` and immediately speak incoming events. On reconnect the client will call `GET /commentary/missed-events?match_id=...&after_id=...` to fetch and enqueue missed events.
-- Polling (legacy): When streaming is disabled the app falls back to polling the `Deliveries` DB table using the logic in `database.py`.
+The system tracks:
+- Events received/spoken/skipped
+- Audio latency (event → queue → playback)
+- Queue depth
+- Final metrics summary on shutdown
 
 ## Runtime State
-`state/runtime_state.json` is used to persist:
+
+Runtime state is persisted in `state/runtime_state.json`:
+
 ```json
 {
-       "match_id": "<uuid>",
-       "last_spoken_ball_detection_id": "<string>",
-       "last_update": 1670000000
+  "last_spoken_event_id": "<uuid>",
+  "match_id": "<uuid>",
+  "last_update": 1670000000
 }
 ```
-This enables restart recovery and prevents duplicate commentary after restarts.
 
-## Installation
+This enables:
+- **Restart Safety**: System resumes from last spoken event
+- **Missed Events**: On reconnect, fetches missed events via REST API
+- **Deduplication**: Prevents repeating events after restart
 
-### Prerequisites
-- Python 3.8+
-- ffmpeg (for any offline audio conversions)
-- MySQL for production usage (or run with dummy mode for tests)
+## Audio Saving
 
-### Python deps
+When `SAVE_AUDIO=true` (default), the system:
 
-Install dependencies:
+1. **Mixes TTS + Background SFX** - Creates final audio with ducked crowd ambience
+2. **Saves to Disk** - Files saved to `audio_history/` directory (configurable)
+3. **Saves to Database** - Metadata saved to `CommentaryAudioHistory` table
 
-```bash
-pip install -r requirements.txt
+**Database Schema:**
+```sql
+CREATE TABLE CommentaryAudioHistory (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ball_id VARCHAR(50) NOT NULL,
+    match_id VARCHAR(50) NOT NULL,
+    audio_path VARCHAR(255) NOT NULL,
+    duration_seconds FLOAT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
-Note: `requirements.txt` now includes `websocket-client` required for streaming.
+## WebSocket Endpoints
 
-## Configuration (env / `config.py`)
-Important environment variables and flags:
-- `API_BASE_URL` — backend base URL (e.g. `http://192.168.18.120:8000`)
-- `USE_WS_STREAMING` — `true` to enable WebSocket streaming mode (default: false)
-- `SPEAK_ONLY_DELIVERIES` — speak only DB deliveries and skip announcements
-- `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` — TTS credentials
-- `AUDIO_TTS_TIMEOUT` — seconds to wait for TTS chunks before skipping (default: 8)
+### Connection
+- **URL**: `ws://<API_BASE_URL>/ws/live-commentary/{match_id}`
+- **Protocol**: WebSocket
+- **Authentication**: Optional (via `WS_AUTH_TOKEN` header)
 
-All defaults are defined in `config.py`.
+### Missed Events (REST)
+- **Endpoint**: `GET /commentary/missed-events`
+- **Parameters**: 
+  - `match_id`: Match identifier
+  - `after_id`: Last spoken event_id (optional)
 
-## Running
+## Reconnection Behavior
 
-Start the commentator:
+The WebSocket client automatically:
 
-```bash
-# Streaming mode (recommended)
-export USE_WS_STREAMING=true
-export API_BASE_URL="http://your.backend:8000"
-export ELEVENLABS_API_KEY="<key>"
-python main.py
+1. **Detects Disconnection** - Monitors connection health
+2. **Exponential Backoff** - Reconnects with increasing delays (1s → 2s → 4s → ... → max 30s)
+3. **Fetches Missed Events** - Calls REST endpoint before resuming stream
+4. **Resumes Streaming** - Continues from last spoken event
 
-# Polling mode (legacy)
-export USE_WS_STREAMING=false
-python main.py
+## Persistent Crowd SFX
+
+- **Starts Once**: Background audio starts at application startup
+- **Never Restarts**: Continues looping throughout the match
+- **Smart Ducking**: Automatically ducks during commentary playback
+- **Volume Control**: 
+  - Normal: 30% volume
+  - Ducking: 8% volume (during TTS)
+
+## File Structure
+
+```
+comv2/
+├── main.py                 # Main orchestrator
+├── ws_client.py            # WebSocket client
+├── event_queue.py          # Event queue with priority
+├── audio_manager.py        # TTS + SFX playback
+├── config.py              # Configuration
+├── database.py             # Database operations
+├── commentary.py           # Intensity mapping
+├── state_manager.py        # Match state
+├── api_client.py           # Backend API
+├── requirements.txt        # Python dependencies
+├── state/
+│   └── runtime_state.json  # Persisted runtime state
+├── background_audio/
+│   └── crowd_of_22050.wav # Background SFX
+└── audio_history/          # Saved audio files
 ```
 
-Logs:
-- Console (INFO)
-- `cricket_commentary.log` in the working directory
+## Next Steps
 
-## Files of interest
-- `state/runtime_state.json` — runtime persisted state
-- `downloads/crowd_of.wav` — SFX (used by legacy mixer), keep in `downloads/`
-- `background_audio/crowd_of_22050.wav` — pre-sampled background audio used by audio engine
-
-## Developer notes
-- The commentary engine treats `sentences` from the event payload as authoritative.
-- `event_queue.py` deduplicates by `ball_detection_id` and persists `last_spoken_ball_detection_id` for restarts.
-- `ws_client.py` will fetch missed events on reconnect from `/commentary/missed-events`.
-- `audio_manager.py` uses a priority queue and may preempt playback for higher-priority events.
-- To change priority mapping, adjust the logic in `event_queue.py` or `main.py` where priorities are assigned.
-
-## Testing and next steps
-Recommended next steps if you want to expand this work:
-- Add unit/integration tests that simulate WebSocket messages and slow/missing TTS streams.
-- Add Prometheus metrics for queue depth and latencies.
-- Harden cancellations of stalled TTS streams if the TTS API exposes a cancel handle.
-
-## Troubleshooting
-- If no audio plays, verify `ELEVENLABS_API_KEY` and network access to the API and TTS endpoints.
-- If streaming mode fails to connect, check `API_BASE_URL` and that the backend exposes `/ws/live-commentary/{match_id}`.
-
----
-
-If you want, I can now:
-- Add a small integration test harness that simulates WS messages locally, or
-- Add Prometheus metrics and a simple `/metrics` endpoint, or
-- Create a minimal example publisher (backend stub) that emits test events.
-
-Which of these would you like next?
-
+Potential enhancements:
+- Prometheus metrics endpoint
+- Integration test harness
+- Performance profiling and optimization
+- Enhanced error recovery
+- Monitoring dashboard
